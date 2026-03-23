@@ -1,80 +1,91 @@
 import streamlit as st
-from matching_engine import MortgageIntelligenceEngine, MortgageScenario
+import os
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+from langchain_community.llms import Ollama
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from pydantic import BaseModel, Field
 
-st.set_page_config(page_title="Mortgage comparison Engine", layout="wide")
-st.title("🏦 Mortgage Intelligence Engine")
+# 1. DEFINE THE DATA MODEL (This prevents the ValidationError)
+class MortgageScenario(BaseModel):
+    fico: int
+    ltv: float
+    loan_amount: float
+    occupancy: str
+    income_type: str  # The missing field from your error
+    foreign_national: bool = False
 
-with st.sidebar:
-    # RESTORED: Borrower Name
-    client_name = st.text_input("Borrower Name", value="New Client")
-    st.divider()
-    
-    inc_type = st.selectbox("Income Type", ["W2", "1099", "Bank Statements", "P&L", "DSCR"])
-    is_fn = st.toggle("Foreign National Borrower")
-    
-    # FIXED: Conditional FICO Logic
-    if is_fn:
-        fn_mode = st.radio("Credit History", ["No US Credit", "Has US FICO"])
-        fico = 0 if "No" in fn_mode else st.slider("US FICO Score", 600, 850, 700)
-    else:
-        fico = st.slider("FICO Score", 600, 850, 680)
-    
-    st.divider()
-    purpose = st.selectbox("Loan Purpose", ["Purchase", "Rate/Term Refi", "Cash-Out Refi"])
-    occ = st.selectbox("Occupancy", ["Primary", "Second Home", "Investment"])
-    
-    st.divider()
-    loan_amt = st.number_input("Loan Amount ($)", value=400000, step=10000)
-    prop_val = st.number_input("Property Value ($)", value=500000, step=10000)
-    
-    if inc_type == "DSCR":
-        income = st.number_input("Est. Monthly Rent ($)", value=4000)
-        debts = 0
-    else:
-        income = st.number_input("Monthly Gross Income ($)", value=12000)
-        debts = st.number_input("Monthly Personal Debts ($)", value=500)
+# 2. PAGE CONFIG
+st.set_page_config(page_title="Mortgage Underwriting Engine", layout="wide")
+st.title("🛡️ Local Underwriting Engine")
 
-# EXECUTION
-ltv = (loan_amt / prop_val) * 100
-engine = MortgageIntelligenceEngine()
-results = engine.run_analysis(MortgageScenario(
-    borrower_name=client_name, fico=fico, ltv=ltv, loan_amount=loan_amt, 
-    monthly_income=income, other_debts=debts, occupancy=occ, 
-    is_foreign_national=is_fn, income_type=inc_type, loan_purpose=purpose
-))
+# 3. LOAD LOCAL DATABASE
+@st.cache_resource
+def load_db():
+    persist_dir = r"c:/Users/luisr/OneDrive/Desktop/Mortgage_Project/local_db"
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    return Chroma(persist_directory=persist_dir, embedding_function=embeddings)
 
-st.header(f"Qualification Report: {client_name}")
+vectorstore = load_db()
 
-# DASHBOARD METRICS
-res = results[0]
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("LTV Ratio", f"{ltv:.1f}%")
-m2.metric("Market Rate", f"{res['rate']:.3f}%")
-m3.metric("Income Ratio", res['dti'])
-m4.metric("Monthly P&I+", f"${res['pitia']:,.2f}")
+# 4. SIDEBAR INPUTS
+st.sidebar.header("Scenario Details")
+fico = st.sidebar.number_input("FICO Score", value=667)
+ltv = st.sidebar.number_input("LTV %", value=80.0)
+loan_amt = st.sidebar.number_input("Loan Amount", value=500000)
+occupancy = st.sidebar.selectbox("Occupancy", ["Primary", "Second Home", "Investment"])
+doc_type = st.sidebar.selectbox("Income Type", ["Bank Statements", "DSCR", "Full Doc", "1099"])
+foreign_national = st.sidebar.checkbox("Foreign National", value=False)
 
-st.divider()
+# 5. RUN ANALYSIS
+if st.button("Check Eligibility"):
+    try:
+        # VALIDATION STEP: Create the scenario object correctly
+        scenario = MortgageScenario(
+            fico=fico,
+            ltv=ltv,
+            loan_amount=loan_amt,
+            occupancy=occupancy,
+            income_type=doc_type,
+            foreign_national=foreign_national
+        )
 
-# LENDER CARDS (ALL LENDERS SHOW RED ON FAILURE)
-st.subheader("Lender Eligibility Comparison")
-for r in results:
-    is_fail = "❌" in r['status']
-    # Expander remains open if the user needs to see why it failed
-    with st.expander(f"{r['status']} | {r['bank']}", expanded=True):
-        col_main, col_audit = st.tabs(["Eligibility Results", "🔍 Evidence Trail"])
+        # Connect to Local LLM (Ollama)
+        llm = Ollama(model="llama3.2")
+
+        # Custom Underwriter Prompt
+        template = """
+        You are a Mortgage Underwriter. Based on the guidelines below, determine eligibility.
+        Context: {context}
+        Scenario: {question}
         
-        with col_main:
-            if is_fail:
-                for msg in r['reasons']:
-                    st.error(f"LENDER DECLINE: {msg}")
-            else:
-                st.success(f"APPROVED: {r['bank']} accepts this scenario.")
-                st.write(f"**Program:** {inc_type} {purpose}")
-                st.write(f"**Required Reserves:** ${r['reserves']:,.2f}")
+        Provide:
+        - Eligibility Status
+        - Specific LTV/FICO limits found in the text
+        - Required Documents for {income_type}
+        """
         
-        with col_audit:
-            if r['audit']:
-                for entry in r['audit']:
-                    st.info(f"Source: {entry['doc']} | Rule: {entry['rule']}")
-            else:
-                st.caption("Using standard Non-QM guideline overlays for this lender.")
+        # Format the query for the database
+        query_text = f"FICO {scenario.fico}, LTV {scenario.ltv}, {scenario.income_type} guidelines"
+        
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=llm,
+            chain_type="stuff",
+            retriever=vectorstore.as_retriever(search_kwargs={"k": 5})
+        )
+
+        with st.spinner("Analyzing guidelines..."):
+            response = qa_chain.invoke(query_text)
+            st.markdown("### Underwriting Analysis")
+            st.write(response["result"])
+
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+# 6. SOURCE VIEW
+with st.expander("View Raw Guidelines"):
+    docs = vectorstore.similarity_search(doc_type, k=3)
+    for doc in docs:
+        st.caption(f"Source: {doc.metadata.get('source')}")
+        st.text(doc.page_content)
