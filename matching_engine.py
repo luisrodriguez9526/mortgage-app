@@ -1,104 +1,106 @@
 import os
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import List, Optional
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+from langchain_community.llms import Ollama
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
 
+# 1. THE DATA MODEL (The "Bouncer")
+# This defines exactly what fields the App MUST provide.
 class MortgageScenario(BaseModel):
-    borrower_name: str
-    fico: int 
+    fico: int
     ltv: float
     loan_amount: float
-    monthly_income: float
-    other_debts: float
-    occupancy: str      
-    income_type: str    
-    is_foreign_national: bool
-    loan_purpose: str
+    occupancy: str
+    income_type: str  # <--- Added this to fix your ValidationError
+    foreign_national: bool = False
 
-class MortgageIntelligenceEngine:
-    def get_market_rate(self, fico: int, is_fn: bool, occupancy: str, inc_type: str, purpose: str) -> float:
-        # Base pricing tiers
-        if is_fn: base_rate = 8.99 if fico >= 660 or fico == 0 else 9.50
-        elif fico >= 720: base_rate = 7.15 
-        elif fico >= 680: base_rate = 7.65 
-        else: base_rate = 8.25
+# 2. THE ENGINE CLASS
+class GuidelineEngine:
+    def __init__(self):
+        # Setup paths
+        self.db_dir = r"c:/Users/luisr/OneDrive/Desktop/Mortgage_Project/local_db"
         
-        # Adjustments
-        if inc_type in ["Bank Statements", "1099", "P&L"]: base_rate += 0.50
-        if inc_type == "DSCR": base_rate += 0.875
-        if occupancy == "Investment": base_rate += 0.375
-        if purpose == "Cash-Out Refi": base_rate += 0.50
-        return base_rate
-
-    def calculate_pitia(self, loan_amount: float, rate: float):
-        mr = (rate / 100) / 12
-        pi = loan_amount * (mr * (1 + mr)**360) / ((1 + mr)**360 - 1)
-        ti = ((loan_amount / 0.8) * 0.015) / 12 
-        return pi + ti
+        # Load the same embeddings used during ingestion
+        self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        
+        # Connect to your local ChromaDB
+        self.vectorstore = Chroma(
+            persist_directory=self.db_dir, 
+            embedding_function=self.embeddings
+        )
+        
+        # Initialize Local LLM (Ollama)
+        self.llm = Ollama(model="llama3.2", temperature=0)
 
     def run_analysis(self, scenario: MortgageScenario):
-        rate = self.get_market_rate(scenario.fico, scenario.is_foreign_national, 
-                                   scenario.occupancy, scenario.income_type, scenario.loan_purpose)
-        pitia = self.calculate_pitia(scenario.loan_amount, rate)
+        """
+        Takes a validated MortgageScenario and returns an AI analysis.
+        """
         
-        # DEFINING LENDER LIMITS (Accuracy Check)
-        # These are the "Red/Green" triggers
-        lender_configs = {
-            "AD MORTGAGE": {"min_fico": 660, "max_ltv": 90, "max_dti": 50, "fn_reserves": 12},
-            "ARC HOME":    {"min_fico": 620, "max_ltv": 85, "max_dti": 50, "fn_reserves": 6},
-            "CHAMPIONS":   {"min_fico": 640, "max_ltv": 80, "max_dti": 45, "fn_reserves": 6},
-            "JMAC":        {"min_fico": 660, "max_ltv": 80, "max_dti": 43, "fn_reserves": 6}
-        }
+        # Custom Underwriting Prompt
+        template = """
+        You are a Senior Mortgage Underwriter. Use the provided guideline context to evaluate the loan.
         
-        final_results = []
+        CONTEXT FROM LENDERS:
+        {context}
+        
+        BORROWER SCENARIO:
+        - FICO: {fico}
+        - LTV: {ltv}%
+        - Income Type: {income_type}
+        - Occupancy: {occupancy}
+        - Loan Amount: ${loan_amt}
+        
+        YOUR TASK:
+        Identify which lenders from the context are ELIGIBLE. 
+        For each lender found in the text, list:
+        1. **Lender Name**
+        2. **Status** (Eligible/Ineligible)
+        3. **Specific Reason** (e.g., "AD Mortgage allows 80% LTV at 660 FICO")
+        4. **Required Docs** (e.g., "Provide 12 months personal bank statements")
+        
+        If no specific lender is found in the context, summarize the general rules found.
+        """
 
-        for bank, rules in lender_configs.items():
-            is_eligible = True
-            reasons = []
-            audit_trail = []
-            
-            # 1. FICO VALIDATION
-            current_min_fico = rules["min_fico"]
-            # DSCR Footnote Exception for AD
-            if bank == "AD MORTGAGE" and scenario.income_type == "DSCR":
-                dscr_ratio = scenario.monthly_income / pitia
-                if dscr_ratio < 1.0:
-                    current_min_fico = 680
-                    if scenario.fico < 680 and scenario.fico > 0:
-                        is_eligible = False
-                        reasons.append(f"AD Footnote: DSCR < 1.0 requires 680 FICO (Current: {scenario.fico})")
+        # Create the search query for the database based on the scenario
+        # We search specifically for the Income Type (e.g., "Bank Statements")
+        search_query = f"{scenario.income_type} guidelines {scenario.ltv} LTV {scenario.fico} FICO"
 
-            if not scenario.is_foreign_national and scenario.fico < current_min_fico:
-                is_eligible = False
-                reasons.append(f"Min FICO for {bank} is {current_min_fico}. (Current: {scenario.fico})")
+        # Setup the Retrieval Chain
+        prompt = PromptTemplate(
+            template=template, 
+            input_variables=["context"],
+            partial_variables={
+                "fico": scenario.fico,
+                "ltv": scenario.ltv,
+                "income_type": scenario.income_type,
+                "occupancy": scenario.occupancy,
+                "loan_amt": scenario.loan_amount
+            }
+        )
 
-            # 2. LTV VALIDATION
-            if scenario.ltv > rules["max_ltv"]:
-                is_eligible = False
-                reasons.append(f"Max LTV for {bank} is {rules['max_ltv']}%. (Current: {scenario.ltv:.1f}%)")
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=self.llm,
+            chain_type="stuff",
+            retriever=self.vectorstore.as_retriever(search_kwargs={"k": 6}),
+            chain_type_kwargs={"prompt": prompt}
+        )
 
-            # 3. DTI/DSCR VALIDATION
-            if scenario.income_type != "DSCR":
-                dti = ((pitia + scenario.other_debts) / scenario.monthly_income) * 100 if scenario.monthly_income > 0 else 0
-                if dti > rules["max_dti"] and not scenario.is_foreign_national:
-                    is_eligible = False
-                    reasons.append(f"DTI {dti:.1f}% exceeds {bank} limit of {rules['max_dti']}%.")
-            
-            # 4. RESERVES
-            res_months = rules["fn_reserves"] if scenario.is_foreign_national else (6 if scenario.occupancy != "Primary" else 3)
-            
-            # 5. AUDIT LOGGING (Proof of Reading)
-            if bank == "AD MORTGAGE":
-                audit_trail.append({"doc": "AD_Mortgage_Product-Matrix.md", "loc": "Main Matrix", "rule": f"Max LTV {rules['max_ltv']}%"})
-                if scenario.is_foreign_national:
-                    audit_trail.append({"doc": "AD Mortgage Foreign Nationals-UW-Requirements.md", "loc": "Reserves Table", "rule": "12 Months Mandatory"})
+        # Run the AI
+        response = qa_chain.invoke(search_query)
+        return response["result"]
 
-            final_results.append({
-                "bank": bank,
-                "status": "✅ ELIGIBLE" if is_eligible else "❌ INELIGIBLE",
-                "reasons": reasons,
-                "audit": audit_trail,
-                "reserves": pitia * res_months,
-                "dti": f"{(scenario.monthly_income / pitia):.2f} (DSCR)" if scenario.income_type == "DSCR" else f"{dti:.1f}%",
-                "rate": rate,
-                "pitia": pitia
-            })
-        return final_results
+# This allows you to test the engine standalone without the App
+if __name__ == "__main__":
+    engine = GuidelineEngine()
+    test_case = MortgageScenario(
+        fico=700,
+        ltv=80.0,
+        loan_amount=500000,
+        occupancy="Primary",
+        income_type="Bank Statements"
+    )
+    print(engine.run_analysis(test_case))
